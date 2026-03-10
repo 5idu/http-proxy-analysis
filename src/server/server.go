@@ -268,65 +268,77 @@ func logResponseBody() gin.HandlerFunc {
 		proxyLog.ProxyDuration = (time.Now().UnixNano() - oldBeginTime) / 1e6
 
 		//配置了新的站点，接口不在配置列表里默认允许get镜像，接口在配置列表里则按照配置是否允许镜像
-		if application.ImageHost != "" && ((apiInfo == nil && c.Request.Method == "GET") ||
+		// 为了避免镜像服务异常或响应过慢影响本地请求，
+		// 将镜像请求和日志入库放到独立 goroutine 中异步执行。
+		needMirror := application.ImageHost != "" && ((apiInfo == nil && c.Request.Method == "GET") ||
 			(apiInfo != nil &&
 				((c.Request.Method == "GET" && apiInfo.GETAllowMirror) ||
 					(c.Request.Method == "POST" && apiInfo.POSTAllowMirror) ||
 					(c.Request.Method == "PUT" && apiInfo.PUTAllowMirror) ||
 					(c.Request.Method == "PATCH" && apiInfo.PATCHAllowMirror) ||
-					(c.Request.Method == "DELETE" && apiInfo.DELETEAllowMirror)))) {
-			imageRequest, err := http.NewRequest(c.Request.Method, application.ImageHost+c.Request.RequestURI, bytes.NewReader(requestData))
-			if err != nil {
-				log.Err(err).Msg("http.ImageRequest")
-			}
-			imageRequest.Header = c.Request.Header
-			newBeginTime := time.Now().UnixNano()
-			//发送镜像请求
-			imageResponse, err := cli.Do(imageRequest)
-			if err != nil && err != ErrorDontRedirect {
-				log.Err(err).Msg("cli.Do(imageRequest)")
-			}
-			if imageResponse != nil {
-				proxyLog.ImageDuration = (time.Now().UnixNano() - newBeginTime) / 1e6
-				proxyLog.ImageResponseStatus = imageResponse.StatusCode
-				imageResponseHeaderBts, err := json.Marshal(imageResponse.Header)
-				if err != nil {
-					log.Err(err).Msg("json.Marshal(imageResponse.Header)")
-				}
-				proxyLog.ImageResponseHeader = string(imageResponseHeaderBts)
+					(c.Request.Method == "DELETE" && apiInfo.DELETEAllowMirror))))
 
-				// 判断返回信息是否压缩
-				contentEncoding := imageResponse.Header.Get("Content-Encoding")
-				switch strings.ToLower(contentEncoding) {
-				case "gzip":
-					var reader *gzip.Reader
-					reader, err = gzip.NewReader(imageResponse.Body)
-					if err != nil {
-						log.Err(err).Msg("gzip.NewReader(imageResponse.Body)")
+		// 由于 gin.Context 不能在 goroutine 中使用，这里只拷贝必要的数据
+		requestMethod := c.Request.Method
+		requestURI := c.Request.RequestURI
+		requestHeader := c.Request.Header.Clone()
+		requestBodyCopy := make([]byte, len(requestData))
+		copy(requestBodyCopy, requestData)
+
+		go func(pl *entity.ProxyLog) {
+			if needMirror {
+				imageRequest, err := http.NewRequest(requestMethod, application.ImageHost+requestURI, bytes.NewReader(requestBodyCopy))
+				if err != nil {
+					log.Err(err).Msg("http.ImageRequest")
+				} else {
+					imageRequest.Header = requestHeader
+					newBeginTime := time.Now().UnixNano()
+					// 发送镜像请求
+					imageResponse, err := cli.Do(imageRequest)
+					if err != nil && err != ErrorDontRedirect {
+						log.Err(err).Msg("cli.Do(imageRequest)")
 					}
-					if reader != nil {
-						readerBts, err := io.ReadAll(reader)
+					if imageResponse != nil {
+						defer imageResponse.Body.Close()
+						pl.ImageDuration = (time.Now().UnixNano() - newBeginTime) / 1e6
+						pl.ImageResponseStatus = imageResponse.StatusCode
+						imageResponseHeaderBts, err := json.Marshal(imageResponse.Header)
 						if err != nil {
-							log.Err(err).Msg("io.ReadAll(reader)")
+							log.Err(err).Msg("json.Marshal(imageResponse.Header)")
 						}
-						proxyLog.ImageResponseBody = string(readerBts)
+						pl.ImageResponseHeader = string(imageResponseHeaderBts)
+
+						// 判断返回信息是否压缩
+						contentEncoding := imageResponse.Header.Get("Content-Encoding")
+						switch strings.ToLower(contentEncoding) {
+						case "gzip":
+							reader, err := gzip.NewReader(imageResponse.Body)
+							if err != nil {
+								log.Err(err).Msg("gzip.NewReader(imageResponse.Body)")
+								break
+							}
+							defer reader.Close()
+							readerBts, err := io.ReadAll(reader)
+							if err != nil {
+								log.Err(err).Msg("io.ReadAll(reader)")
+							}
+							pl.ImageResponseBody = string(readerBts)
+						// todo 支持其他压缩算法
+						default:
+							readerBts, err := io.ReadAll(imageResponse.Body)
+							if err != nil {
+								log.Err(err).Msg("io.ReadAll(imageResponse.Body)")
+							}
+							pl.ImageResponseBody = string(readerBts)
+						}
 					}
-				// todo 支持其他压缩算法
-				default:
-					readerBts, err := io.ReadAll(imageResponse.Body)
-					if err != nil {
-						log.Err(err).Msg("io.ReadAll(imageResponse.Body)")
-					}
-					proxyLog.ImageResponseBody = string(readerBts)
 				}
 			}
-		}
-		// fmt.Println(proxyLog.ProxyResponseStatus)
-		// fmt.Println(proxyLog.ProxyResponseHeader)
-		// fmt.Println(proxyLog.ProxyResponseBody)
-		result, err := service.InsertProwyLog(proxyLog)
-		if !result {
-			log.Err(err).Msg("WriteLog Failed")
-		}
+
+			result, err := service.InsertProwyLog(pl)
+			if !result {
+				log.Err(err).Msg("WriteLog Failed")
+			}
+		}(proxyLog)
 	}
 }
